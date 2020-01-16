@@ -773,8 +773,13 @@ type
 
   TSuperRttiContext = class
   private
+    FLastInfo: string;
+    FRootObject: TObject;
+    procedure AddError(ErrorMessage: string);
     class function GetFieldName(r: TRttiField): string;
+    class function GetPropertyName(r: TRttiProperty): string;
     class function GetFieldDefault(r: TRttiField; const obj: ISuperObject): ISuperObject;
+    class function GetPropertyDefault(r: TRttiProperty; const obj: ISuperObject): ISuperObject;
   public
     Context: TRttiContext;
     SerialFromJson: TDictionary<PTypeInfo, TSerialFromJson>;
@@ -1487,7 +1492,8 @@ begin
         Result := False;
     end;
   else
-    Result := False;
+    if obj = nil then TValueData(Value).FAsSLong := 0;
+    Result := obj = nil;
   end;
 end;
 
@@ -5887,6 +5893,12 @@ begin
   Context.Free;
 end;
 
+procedure TSuperRttiContext.AddError(ErrorMessage: string);
+begin
+    if FLastInfo <> '' then FLastInfo := FLastInfo + #13#10;
+    FLastInfo := FLastInfo + ErrorMessage;
+end;
+
 class function TSuperRttiContext.GetFieldName(r: TRttiField): string;
 var
   o: TCustomAttribute;
@@ -5897,7 +5909,28 @@ begin
   Result := r.Name;
 end;
 
+class function TSuperRttiContext.GetPropertyName(r: TRttiProperty): string;
+var
+  o: TCustomAttribute;
+begin
+  for o in r.GetAttributes do
+    if o is SOName then
+      Exit(SOName(o).Name);
+  Result := r.Name;
+end;
+
 class function TSuperRttiContext.GetFieldDefault(r: TRttiField; const obj: ISuperObject): ISuperObject;
+var
+  o: TCustomAttribute;
+begin
+  if not ObjectIsType(obj, stNull) then Exit(obj);
+  for o in r.GetAttributes do
+    if o is SODefault then
+      Exit(SO(SODefault(o).Name));
+  Result := obj;
+end;
+
+class function TSuperRttiContext.GetPropertyDefault(r: TRttiProperty; const obj: ISuperObject): ISuperObject;
 var
   o: TCustomAttribute;
 begin
@@ -5927,8 +5960,7 @@ begin
     Result := ToJson(v, so);
 end;
 
-function TSuperRttiContext.FromJson(TypeInfo: PTypeInfo; const obj: ISuperObject;
-  var Value: TValue): Boolean;
+function TSuperRttiContext.FromJson(TypeInfo: PTypeInfo; const obj: ISuperObject; var Value: TValue): Boolean;
 
   procedure FromChar;
   begin
@@ -5971,8 +6003,10 @@ function TSuperRttiContext.FromJson(TypeInfo: PTypeInfo; const obj: ISuperObject
         end else
           Result := False;
       end;
-    else
+    else begin
       Result := False;
+      //acá es donde NULL del json no se mapea al objeto, podría ser un valor x defecto (0, -1) o una exception directamente.
+      end;
     end;
   end;
 
@@ -6106,6 +6140,51 @@ function TSuperRttiContext.FromJson(TypeInfo: PTypeInfo; const obj: ISuperObject
       // error
       Value := nil;
       Result := False;
+    end;
+  end;
+
+  procedure FromClass2;
+  var
+    f: TRttiProperty;
+    v: TValue;
+    s: string;
+  begin
+    case ObjectGetType(obj) of
+      stObject:
+        begin
+          //if FRootObject = nil then FRootObject := Value.AsObject; Genera InvalidPointerOperation.
+          Result := True;
+          if Value.Kind <> tkClass then
+            Value := GetTypeData(TypeInfo).ClassType.Create;
+          for f in Context.GetType(Value.AsObject.ClassType).GetProperties do
+            if f.PropertyType <> nil then
+            begin
+              v := TValue.Empty;
+              Result := FromJson(f.PropertyType.Handle, GetPropertyDefault(f, obj.AsObject[GetPropertyName(f)]), v);
+              if Result then
+                f.SetValue(Value.AsObject, v)
+              else begin
+                try
+                    s := obj.AsObject[GetPropertyName(f)].AsJSon(false, false);
+                except
+                    s := 'nil?';
+                end;
+
+                AddError('Invalid FromJson on property ' + TypeInfo.Name + '.' + f.Name + ':' + f.PropertyType.QualifiedName + '. Json value: ' + s);
+                Exit;
+              end
+            end;
+        end;
+      stNull:
+        begin
+          Value := nil;
+          Result := True;
+        end
+    else
+      // error
+      Value := nil;
+      Result := False;
+      AddError('result false porque objectType es cualquiera: ord=' + IntToStr(Ord(ObjectGetType(obj))));
     end;
   end;
 
@@ -6337,35 +6416,48 @@ function TSuperRttiContext.FromJson(TypeInfo: PTypeInfo; const obj: ISuperObject
 var
   Serial: TSerialFromJson;
 begin
-
+//acá empieza function TSuperRttiContext.FromJson(TypeInfo: PTypeInfo; const obj: ISuperObject; var Value: TValue): Boolean;
+//que tiene un montón de métodos internos
   if TypeInfo <> nil then
   begin
-    if not SerialFromJson.TryGetValue(TypeInfo, Serial) then
-      case TypeInfo.Kind of
-        tkChar: FromChar;
-        tkInt64: FromInt64;
-        tkEnumeration, tkInteger: FromInt(obj);
-        tkSet: fromSet;
-        tkFloat: FromFloat(obj);
-        tkString, tkLString, tkUString, tkWString: FromString;
-        tkClass: FromClass;
-        tkMethod: ;
-        tkWChar: FromWideChar;
-        tkRecord: FromRecord;
-        tkPointer: ;
-        tkInterface: FromInterface;
-        tkArray: FromArray;
-        tkDynArray: FromDynArray;
-        tkClassRef: FromClassRef;
+    if not SerialFromJson.TryGetValue(TypeInfo, Serial) then begin
+
+//        AddError('From json on ' + TypeInfo.Name + ' from '); if obj <> nil then AddError(obj.AsJSon) else AddError('nil');
+
+          case TypeInfo.Kind of
+            tkChar: FromChar;
+            tkInt64: FromInt64;
+            tkEnumeration, tkInteger: FromInt(obj);
+            tkSet: fromSet;
+            tkFloat: FromFloat(obj);
+            tkString, tkLString, tkUString, tkWString: FromString;
+            tkClass: FromClass2;
+            tkMethod: ;
+            tkWChar: FromWideChar;
+            tkRecord: FromRecord;
+            tkPointer: ;
+            tkInterface: FromInterface;
+            tkArray: FromArray;
+            tkDynArray: FromDynArray;
+            tkClassRef: FromClassRef;
+          else
+            FromUnknown
+          end;
+      end
       else
-        FromUnknown
-      end else
-      begin
-        TValue.Make(nil, TypeInfo, Value);
-        Result := Serial(Self, obj, Value);
-      end;
-  end else
+          begin
+            TValue.Make(nil, TypeInfo, Value);
+            Result := Serial(Self, obj, Value);
+            if not Result then begin
+                AddError(TypeInfo.Name + '=');
+                if obj = nil then AddError('nil') else AddError(obj.AsString);
+             end
+
+          end;
+  end else begin
     Result := False;
+    AddError('TypeInfo is nil');
+  end;
 end;
 
 function TSuperRttiContext.ToJson(var value: TValue; const index: ISuperObject): ISuperObject;
@@ -6418,6 +6510,31 @@ function TSuperRttiContext.ToJson(var value: TValue; const index: ISuperObject):
           begin
             v := f.GetValue(Value.AsObject);
             Result.AsObject[GetFieldName(f)] := ToJson(v, index);
+          end
+      end else
+        Result := o;
+    end else
+      Result := nil;
+  end;
+
+  procedure ToClass2;
+  var
+    o: ISuperObject;
+    f: TRttiProperty;
+    v: TValue;
+  begin
+    if TValueData(Value).FAsObject <> nil then
+    begin
+      o := index[IntToStr(NativeInt(Value.AsObject))];
+      if o = nil then
+      begin
+        Result := TSuperObject.Create(stObject);
+        index[IntToStr(NativeInt(Value.AsObject))] := Result;
+        for f in Context.GetType(Value.AsObject.ClassType).GetProperties do
+          if f.PropertyType <> nil then
+          begin
+            v := f.GetValue(Value.AsObject);
+            Result.AsObject[GetPropertyName(f)] := ToJson(v, index);
           end
       end else
         Result := o;
@@ -6552,7 +6669,7 @@ begin
       tkSet, tkInteger, tkEnumeration: ToInteger;
       tkFloat: ToFloat;
       tkString, tkLString, tkUString, tkWString: ToString;
-      tkClass: ToClass;
+      tkClass: ToClass2;
       tkWChar: ToWChar;
       tkVariant: ToVariant;
       tkRecord: ToRecord;
@@ -6580,12 +6697,21 @@ begin
   end else
     ctxowned := False;
   try
-    v := Self;
-    if not ctx.FromJson(v.TypeInfo, obj, v) then
-      raise Exception.Create('Invalid object');
+    try
+        v := Self;
+        if not ctx.FromJson(v.TypeInfo, obj, v) then
+          raise Exception.Create('Invalid object, last info: ' + ctx.FLastInfo);
+        ctx.FRootObject := nil;
+     except
+        on E: EAccessViolation do begin
+          raise Exception.Create('Uncaught error. Last info: ' + ctx.FLastInfo + #13#10 + e.Message);
+        end
+        else
+          raise;
+     end;
   finally
-    if ctxowned then
-      ctx.Free;
+    if ctx.FRootObject <> nil then ctx.FRootObject.Free;//to avoid memory leaks.
+    if ctxowned then ctx.Free;
   end;
 end;
 
